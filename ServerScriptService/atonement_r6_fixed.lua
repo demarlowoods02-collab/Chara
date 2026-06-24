@@ -1,9 +1,6 @@
 -- ServerScriptService/atonement_r6_fixed.lua
 -- Plays the Atonement animation on an actual R6 dummy/NPC when the Atonement tool is activated.
--- Installs a server-side listener that finds a nearby R6 NPC (not a player character),
--- attempts to set network ownership of its baseparts to the activating player (if supported),
--- ensures an Animator exists on the Humanoid, and plays the animation.
--- FIXED: Handles rejoin persistence and completes broken line 155
+-- FIXED: Ensures animations replicate to ALL players without requiring rejoin
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -11,12 +8,10 @@ local ServerStorage = game:GetService("ServerStorage")
 local StarterPack = game:GetService("StarterPack")
 local RunService = game:GetService("RunService")
 
-local TOOL_NAME = "Atonement" -- name of the tool to listen for
-local ANIM_CHILD_NAME = "AnimationId" -- optional NumberValue under the Tool that stores the anim id
-local DEFAULT_ANIM_ID = 123456789 -- replace with your atonement/victim animation id if you want a default
-local SEARCH_RADIUS = 60 -- studs to search for an R6 NPC
-
-local playerAnimationTracks = {} -- Store active tracks for rejoin persistence
+local TOOL_NAME = "Atonement"
+local ANIM_CHILD_NAME = "AnimationId"
+local DEFAULT_ANIM_ID = 123456789
+local SEARCH_RADIUS = 60
 
 local function findToolRoot()
 	local containers = {ReplicatedStorage, ServerStorage, StarterPack, workspace}
@@ -26,7 +21,6 @@ local function findToolRoot()
 			return t
 		end
 	end
-	-- also check within StarterPack children recursively (some tools are nested)
 	local function searchRecursive(parent)
 		for _,child in ipairs(parent:GetChildren()) do
 			if child.Name == TOOL_NAME and child:IsA("Tool") then return child end
@@ -89,9 +83,8 @@ local function trySetNetworkOwnerOnModel(model, player)
 	for _,part in ipairs(model:GetDescendants()) do
 		if part:IsA("BasePart") then
 			pcall(function()
-				-- SetNetworkOwner is available on Server for BasePart
-				if part.SetNetworkOwner then
-					part:SetNetworkOwner(player)
+				if part:FindFirstChild("BodyVelocity") or part.Parent:FindFirstChildOfClass("Humanoid") then
+					part:SetNetworkOwner(nil) -- Server ownership for proper replication
 				end
 			end)
 		end
@@ -108,98 +101,113 @@ local function ensureAnimator(humanoid)
 	return animator
 end
 
-local function playAnimationOnModel(model, animId)
+local function playAnimationOnModel(model, animId, activatingPlayer)
 	if not model then return end
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
 	if not humanoid then return end
+	
+	-- Ensure server ownership for proper animation replication
+	pcall(function()
+		for _, part in ipairs(model:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part:SetNetworkOwner(nil)
+			end
+		end
+	end)
+	
 	local animator = ensureAnimator(humanoid)
 	local animation = Instance.new("Animation")
 	animation.Name = "AtonementTempAnim"
 	animation.AnimationId = "rbxassetid://" .. tostring(animId)
+	
 	local ok, track = pcall(function()
 		return animator:LoadAnimation(animation)
 	end)
+	
 	if not ok or not track then
-		-- fallback
 		local ok2, t2 = pcall(function()
 			return humanoid:LoadAnimation(animation)
 		end)
 		track = ok2 and t2 or nil
 	end
+	
 	if not track then
 		warn("Atonement: failed to load animation on model", model:GetFullName())
 		animation:Destroy()
 		return nil
 	end
+	
 	track.Priority = Enum.AnimationPriority.Action
 	track:Play()
-	-- optional: return track so caller can stop it
+	
+	-- Force attribute update to trigger replication to all clients
+	model:SetAttribute("AnimationPlaying_" .. tick(), animId)
+	
+	-- Replicate to all players by firing a change event
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part:SetAttribute("AnimSync", animId)
+		end
+	end
+	
 	return track
 end
 
--- Main wiring: find the atonement tool and hook activation
 local function onToolFound(tool)
 	if not tool then return end
-	-- Connect when Tool is parented into a player's Backpack/Character
+	
 	local function onEquipped(playerTool)
 		local player = Players:GetPlayerFromCharacter(playerTool.Parent)
 		if not player then return end
-		-- use Activated on the tool in the player's character or backpack
+		
 		local function onActivated()
 			local char = player.Character
 			local pos
-			if char and char.PrimaryPart then pos = char.PrimaryPart.Position
+			
+			if char and char.PrimaryPart then
+				pos = char.PrimaryPart.Position
 			elseif char then
 				local root = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart")
 				if root then pos = root.Position end
 			end
-			-- FIXED: Complete the broken line 155
+			
 			pos = pos or Vector3.new(0, 0, 0)
 			
-			-- find nearest R6 NPC
 			local target = findNearestR6NPC(pos, SEARCH_RADIUS)
 			if not target then
 				warn("Atonement: no R6 NPC found nearby")
 				return
 			end
-			-- try to set network ownership of the model's parts to this player
+			
+			-- Set server ownership to ensure all clients see animation
 			pcall(function()
 				trySetNetworkOwnerOnModel(target, player)
 			end)
-			-- get anim id from the tool
+			
 			local animId = getAnimIdFromTool(tool)
-			-- play on the target model
-			local track = playAnimationOnModel(target, animId)
-			-- Store for rejoin persistence
-			if track then
-				playerAnimationTracks[player.UserId] = {track = track, animId = animId, model = target}
-			end
+			playAnimationOnModel(target, animId, player)
 		end
-		-- Ensure we connect to the Equipped tool instance belonging to this player
-		-- Look for the tool in the player's Backpack or Character
+		
 		local function connectToolInstance()
 			local backpack = player:FindFirstChildOfClass("Backpack")
 			local tinst = (player.Character and player.Character:FindFirstChild(tool.Name)) or (backpack and backpack:FindFirstChild(tool.Name))
 			if tinst and tinst:IsA("Tool") then
-				-- connect Activated
 				if not tinst:GetAttribute("AtonementHooked") then
 					tinst.Activated:Connect(onActivated)
 					tinst:SetAttribute("AtonementHooked", true)
 				end
 			end
 		end
-		-- Connect on character added to ensure Equipped tool is connected
+		
 		player.CharacterAdded:Connect(function()
 			connectToolInstance()
 		end)
+		
 		connectToolInstance()
 	end
 
-	-- When tool is cloned into player (e.g., StarterPack -> Backpack), monitor Players
 	Players.PlayerAdded:Connect(function(player)
-		-- give server a little delay for Backpack/Character to exist
 		player.CharacterAdded:Connect(function()
-			-- attempt to connect any Tool instance now in Backpack/Character
 			local backpack = player:FindFirstChildOfClass("Backpack")
 			if backpack then
 				local tinst = (player.Character and player.Character:FindFirstChild(tool.Name)) or backpack:FindFirstChild(tool.Name)
@@ -210,17 +218,14 @@ local function onToolFound(tool)
 		end)
 	end)
 
-	-- Also connect if the tool is manually given or moved into a player later
 	tool.AncestryChanged:Connect(function(child, parent)
 		if parent and parent:IsDescendantOf(Players) then
-			-- do nothing; Players container doesn't parent tools directly
+			-- do nothing
 		end
 	end)
 
-	-- If the tool is directly in StarterPack, connect for current players
 	for _,player in ipairs(Players:GetPlayers()) do
 		if player.Character or player:FindFirstChildOfClass("Backpack") then
-			-- attempt to connect
 			local backpack = player:FindFirstChildOfClass("Backpack")
 			local tinst = (player.Character and player.Character:FindFirstChild(tool.Name)) or (backpack and backpack:FindFirstChild(tool.Name))
 			if tinst and tinst:IsA("Tool") then
@@ -230,17 +235,9 @@ local function onToolFound(tool)
 	end
 end
 
--- Clean up on player leave
-Players.PlayerRemoving:Connect(function(player)
-	if playerAnimationTracks[player.UserId] then
-		playerAnimationTracks[player.UserId] = nil
-	end
-end)
-
--- Run
 local tool = findToolRoot()
 if tool then
 	onToolFound(tool)
 else
-	warn("Atonement tool not found by server listener. Please ensure a Tool named '"..TOOL_NAME.."' exists in ReplicatedStorage, ServerStorage, StarterPack or workspace.")
+	warn("Atonement tool not found. Ensure Tool named '"..TOOL_NAME.."' exists in ReplicatedStorage, ServerStorage, StarterPack or workspace.")
 end
